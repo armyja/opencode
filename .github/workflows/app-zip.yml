@@ -1,0 +1,172 @@
+name: build-app-zip
+
+on:
+  push:
+    branches:
+      - dev
+      - ci
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version override (optional)"
+        required: false
+        type: string
+      auto_publish:
+        description: "Auto-publish to GitHub Releases"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build-app:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-bun
+
+      - name: Determine version
+        id: version
+        run: |
+          # If triggered by a tag, use the tag name
+          if [[ "${{ github.ref }}" =~ ^refs/tags/v ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          # If version input provided
+          elif [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          # Otherwise use package.json version
+          else
+            VERSION=$(node -e "console.log(require('./packages/opencode/package.json').version)" 2>/dev/null || echo "dev")
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          fi
+          echo "Full version: $VERSION"
+
+      - name: Build app frontend
+        run: |
+          cd packages/app
+          bun install
+          bun run build
+          echo "App built successfully in packages/app/dist"
+
+      - name: Create app ZIP
+        run: |
+          cd packages/app
+          VERSION="${{ steps.version.outputs.version }}"
+          
+          # Create a clean directory for the ZIP contents
+          mkdir -p app-${VERSION}
+          
+          # Copy dist contents
+          cp -r dist/* app-${VERSION}/
+          
+          # Create version file
+          echo "${VERSION}" > app-${VERSION}/VERSION.txt
+          
+          # Create README
+          cat > app-${VERSION}/README.md << 'EOF'
+          # OpenCode App Frontend
+          
+          This ZIP contains the static frontend files for OpenCode App.
+          
+          ## Usage
+          
+          These files should be served by a web server. The OpenCode CLI can serve them automatically with:
+          
+          ```bash
+          opencode web
+          ```
+          
+          Or you can serve them manually with any static file server:
+          
+          ```bash
+          # Using Python
+          python3 -m http.server 8080 --directory .
+          
+          # Using Bun
+          bunx serve .
+          
+          # Using Node.js
+          npx serve .
+          ```
+          
+          ## Contents
+          
+          - Static HTML, CSS, and JavaScript files
+          - All assets (images, fonts, etc.)
+          - Configuration files
+          
+          ## Requirements
+          
+          - A web server (any static file server will work)
+          - The OpenCode CLI server running separately (for API functionality)
+          
+          For more information, visit: https://opencode.ai
+          EOF
+          
+          # Create ZIP file
+          zip -r ../opencode-app-${VERSION}.zip app-${VERSION}
+          
+          echo "App ZIP created: opencode-app-${VERSION}.zip"
+          ls -lh ../opencode-app-${VERSION}.zip
+
+      - name: Upload app ZIP as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-app-zip
+          path: packages/app/opencode-app-*.zip
+          retention-days: 7
+
+      - name: Upload app dist as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-app-dist
+          path: packages/app/dist/
+          retention-days: 7
+
+  publish-app:
+    needs: build-app
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: |
+      (github.event_name == 'workflow_dispatch' && inputs.auto_publish == true) ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+    steps:
+      - name: Download app ZIP
+        uses: actions/download-artifact@v4
+        with:
+          name: opencode-app-zip
+          path: .
+
+      - name: Get tag name
+        id: tag-name
+        run: |
+          if [[ "${{ github.ref }}" =~ ^refs/tags/v ]]; then
+            TAG_NAME="${{ github.ref }}"
+          else
+            TAG_NAME="v${{ steps.version.outputs.version }}"
+          fi
+          echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Get release notes
+        id: release-notes
+        run: |
+          # Generate changelog from commits
+          git log --oneline --decorate -20 > release-notes.md
+          echo "release_notes_file=release-notes.md" >> $GITHUB_OUTPUT
+
+      - name: Release app ZIP
+        uses: softprops/action-gh-release@v2
+        with:
+          files: opencode-app-*.zip
+          name: "OpenCode App v${{ steps.version.outputs.version }}"
+          body_path: release-notes.md
+          draft: false
+          prerelease: false
+          tag_name: ${{ steps.tag-name.outputs.tag_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
